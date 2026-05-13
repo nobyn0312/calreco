@@ -9,6 +9,8 @@ export type NutritionJson = {
   }>;
   total: { kcal: number; p: number; f: number; c: number };
   notes?: string;
+  /** 手動編集した「内訳」一行表示。ある場合は formatFoodsSummary がこれを優先 */
+  foodsSummary?: string;
 };
 
 /** DBやAIの揺れを吸収して、表表示・保存用に揃える */
@@ -48,14 +50,21 @@ export function coerceNutrition(result: unknown): NutritionJson {
   });
 
   const notes = obj.notes;
-  return {
+  const fs = obj.foodsSummary;
+  const foodsSummary =
+    typeof fs === "string" && fs.trim() ? fs.trim() : undefined;
+
+  const base: NutritionJson = {
     foods,
     total,
     notes: typeof notes === "string" && notes.trim() ? notes : undefined,
   };
+  if (foodsSummary) base.foodsSummary = foodsSummary;
+  return base;
 }
 
 export function formatFoodsSummary(n: NutritionJson): string {
+  if (n.foodsSummary?.trim()) return n.foodsSummary.trim();
   if (!n.foods.length) return "—";
   return n.foods
     .map((food) => {
@@ -63,4 +72,24 @@ export function formatFoodsSummary(n: NutritionJson): string {
       return `${food.name}${amt}`;
     })
     .join(" · ");
+}
+
+/** 手動修正後の result JSON を組み立てる（foods 配列は維持、total と任意の foodsSummary を上書き） */
+export function buildPatchedMealResult(
+  existing: unknown,
+  patch: {
+    rawInput: string;
+    foodsLine: string;
+    total: { kcal: number; p: number; f: number; c: number };
+  }
+): NutritionJson {
+  const base = coerceNutrition(existing);
+  const out: NutritionJson = {
+    foods: base.foods,
+    total: patch.total,
+    notes: base.notes,
+  };
+  const trimmed = patch.foodsLine.trim();
+  if (trimmed) out.foodsSummary = trimmed;
+  return out;
 }

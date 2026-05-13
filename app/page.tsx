@@ -43,6 +43,15 @@ function logToDraft(log: MealLog): RowDraft {
   };
 }
 
+function parseDraftTotal(d: RowDraft): { kcal: number; p: number; f: number; c: number } | null {
+  const kcal = Number(d.kcal);
+  const p = Number(d.p);
+  const f = Number(d.f);
+  const c = Number(d.c);
+  if (![kcal, p, f, c].every((n) => Number.isFinite(n) && n >= 0)) return null;
+  return { kcal, p, f, c };
+}
+
 export default function Home() {
   const [message, setMessage] = useState("");
   const [reply, setReply] = useState("");
@@ -56,6 +65,7 @@ export default function Home() {
   const [drafts, setDrafts] = useState<Record<number, RowDraft>>({});
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   const selectAllRef = useRef<HTMLInputElement>(null);
 
@@ -159,8 +169,9 @@ export default function Home() {
       return next;
     });
     setDrafts((prev) => {
-      const { [id]: _, ...rest } = prev;
-      return rest;
+      const next = { ...prev };
+      delete next[id];
+      return next;
     });
   };
 
@@ -211,14 +222,67 @@ export default function Home() {
     }
   };
 
-  const onSaveEdits = () => {
+  const onSaveEdits = async () => {
     if (editing.size === 0) {
       setActionNotice("編集中の行がありません。「更新」でチェックした行を編集モードにしてください。");
       return;
     }
-    setActionNotice(
-      `更新APIは未実装です（${editing.size}行の入力内容はまだサーバーに保存されません）。PATCH実装後に反映されます。`
-    );
+
+    const items: Array<{
+      id: number;
+      rawInput: string;
+      foodsLine: string;
+      total: { kcal: number; p: number; f: number; c: number };
+    }> = [];
+
+    for (const id of editing) {
+      const d = drafts[id];
+      if (!d) {
+        setActionNotice(`行 id=${id} の編集データがありません。`);
+        return;
+      }
+      const total = parseDraftTotal(d);
+      if (!total) {
+        setActionNotice(
+          `行 id=${id}: カロリー・P・F・C は 0 以上の数値にしてください（現在の入力を確認してください）。`
+        );
+        return;
+      }
+      items.push({
+        id,
+        rawInput: d.rawInput,
+        foodsLine: d.foodsLine,
+        total,
+      });
+    }
+
+    setIsSaving(true);
+    setActionNotice(null);
+    try {
+      const res = await fetch("/api/memo", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
+      const data = (await res.json()) as { error?: string; updated?: number };
+
+      if (!res.ok) {
+        setActionNotice(
+          typeof data.error === "string" ? data.error : "更新に失敗しました。"
+        );
+        return;
+      }
+
+      const n = typeof data.updated === "number" ? data.updated : items.length;
+      setActionNotice(`${n} 件を更新しました。`);
+      setEditing(new Set());
+      setDrafts({});
+      await refreshLogs();
+    } catch {
+      setActionNotice("更新の通信に失敗しました。");
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleSubmit = async () => {
@@ -383,10 +447,21 @@ export default function Home() {
               </div>
               {editing.size > 0 ? (
                 <div className="flex flex-wrap gap-2 border-t border-neutral-200 pt-3">
-                  <Button type="button" size="sm" onClick={onSaveEdits}>
-                    変更を保存
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => void onSaveEdits()}
+                    disabled={isSaving}
+                  >
+                    {isSaving ? "保存中…" : "変更を保存"}
                   </Button>
-                  <Button type="button" variant="outline" size="sm" onClick={cancelAllEdits}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={cancelAllEdits}
+                    disabled={isSaving}
+                  >
                     編集をすべてキャンセル
                   </Button>
                 </div>
