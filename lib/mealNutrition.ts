@@ -74,6 +74,17 @@ export function formatFoodsSummary(n: NutritionJson): string {
     .join(" · ");
 }
 
+/** 1 品目の kcal / PFC を 1 行で表示（一覧の開閉用） */
+export function formatFoodItemLine(food: NutritionJson["foods"][number]): string {
+  const amt =
+    food.amount !== undefined &&
+    food.amount !== null &&
+    String(food.amount).trim() !== ""
+      ? `（${String(food.amount).trim()}）`
+      : "";
+  return `${food.name}${amt}  ${food.kcal}kcal  P${food.p}g  F${food.f}g  C${food.c}g`;
+}
+
 /** 手動修正後の result JSON を組み立てる（foods 配列は維持、total と任意の foodsSummary を上書き） */
 export function buildPatchedMealResult(
   existing: unknown,

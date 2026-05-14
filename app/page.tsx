@@ -1,6 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, Fragment } from "react";
+import Link from "next/link";
+import { useSession } from "next-auth/react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
@@ -8,8 +10,15 @@ import { cn } from "@/lib/utils";
 import {
   coerceNutrition,
   formatFoodsSummary,
+  formatFoodItemLine,
+  buildPatchedMealResult,
   type NutritionJson,
 } from "@/lib/mealNutrition";
+import {
+  type ChatTurn,
+  formatAssistantTurnForHistory,
+  displayAssistantHistoryContent,
+} from "@/lib/chatHistory";
 
 type MealLog = {
   id: number;
@@ -52,13 +61,26 @@ function parseDraftTotal(d: RowDraft): { kcal: number; p: number; f: number; c: 
   return { kcal, p, f, c };
 }
 
+type PendingRecord = {
+  assistantMessage: string;
+  baseNutrition: NutritionJson;
+  draft: RowDraft;
+};
+
 export default function Home() {
+  const { status: sessionStatus } = useSession();
   const [message, setMessage] = useState("");
-  const [reply, setReply] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [logs, setLogs] = useState<MealLog[]>([]);
   const [dbError, setDbError] = useState<string | null>(null);
   const [saveHint, setSaveHint] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [pendingRecord, setPendingRecord] = useState<PendingRecord | null>(null);
+  const [pendingFormError, setPendingFormError] = useState<string | null>(null);
+  const [isSavingRecord, setIsSavingRecord] = useState(false);
+  const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
+  const [expandedFoodRows, setExpandedFoodRows] = useState<Set<number>>(new Set());
+  const [pendingFoodsExpanded, setPendingFoodsExpanded] = useState(false);
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [editing, setEditing] = useState<Set<number>>(new Set());
@@ -71,8 +93,21 @@ export default function Home() {
 
   const refreshLogs = useCallback(async () => {
     try {
-      const res = await fetch("/api/memo", { cache: "no-store" });
+      const res = await fetch("/api/memo", {
+        cache: "no-store",
+        credentials: "include",
+      });
       const data = (await res.json()) as { logs?: MealLog[]; error?: string };
+
+      if (res.status === 401) {
+        setLogs([]);
+        setDbError(
+          typeof data.error === "string"
+            ? data.error
+            : "食事記録の保存・一覧にはログインが必要です。"
+        );
+        return;
+      }
 
       if (res.ok && Array.isArray(data.logs)) {
         setLogs(data.logs);
@@ -96,12 +131,22 @@ export default function Home() {
   }, [refreshLogs]);
 
   useEffect(() => {
+    if (sessionStatus === "authenticated") {
+      void refreshLogs();
+    }
+  }, [sessionStatus, refreshLogs]);
+
+  useEffect(() => {
     const ids = new Set(logs.map((l) => l.id));
     setSelected((prev) => {
       const next = new Set([...prev].filter((id) => ids.has(id)));
       return next.size === prev.size ? prev : next;
     });
     setEditing((prev) => {
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+    setExpandedFoodRows((prev) => {
       const next = new Set([...prev].filter((id) => ids.has(id)));
       return next.size === prev.size ? prev : next;
     });
@@ -181,6 +226,25 @@ export default function Home() {
     setActionNotice(null);
   };
 
+  const clearConversation = () => {
+    setChatTurns([]);
+    setMessage("");
+    setPendingRecord(null);
+    setPendingFormError(null);
+    setChatError(null);
+    setSaveHint(null);
+    setPendingFoodsExpanded(false);
+  };
+
+  const toggleFoodDetailRow = (id: number) => {
+    setExpandedFoodRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   const onBulkDelete = async () => {
     if (selected.size === 0) {
       setActionNotice("削除する行をチェックで選んでください。");
@@ -200,6 +264,7 @@ export default function Home() {
       const res = await fetch("/api/memo", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ ids: [...selected] }),
       });
       const data = (await res.json()) as { error?: string; deleted?: number };
@@ -262,6 +327,7 @@ export default function Home() {
       const res = await fetch("/api/memo", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ items }),
       });
       const data = (await res.json()) as { error?: string; updated?: number };
@@ -285,58 +351,139 @@ export default function Home() {
     }
   };
 
+  const savePendingToMemo = async () => {
+    if (!pendingRecord) return;
+    if (sessionStatus !== "authenticated") {
+      setPendingFormError("記録するにはログインしてください。");
+      return;
+    }
+    const total = parseDraftTotal(pendingRecord.draft);
+    if (!total) {
+      setPendingFormError("カロリー・P・F・C は 0 以上の数値にしてください。");
+      return;
+    }
+    if (!pendingRecord.draft.rawInput.trim()) {
+      setPendingFormError("内容（食事の説明）を入力してください。");
+      return;
+    }
+
+    setPendingFormError(null);
+    setIsSavingRecord(true);
+    setSaveHint(null);
+    try {
+      const result = buildPatchedMealResult(pendingRecord.baseNutrition, {
+        rawInput: pendingRecord.draft.rawInput,
+        foodsLine: pendingRecord.draft.foodsLine,
+        total,
+      });
+      const res = await fetch("/api/memo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          rawInput: pendingRecord.draft.rawInput.trim(),
+          result,
+        }),
+      });
+      const memoData = (await res.json()) as { error?: string };
+
+      if (!res.ok) {
+        setDbError(
+          typeof memoData.error === "string" ? memoData.error : "DBへの保存に失敗しました。"
+        );
+        return;
+      }
+
+      setDbError(null);
+      setSaveHint("記録テーブルに保存しました。");
+      setPendingRecord(null);
+      setChatTurns([]);
+      await refreshLogs();
+    } catch {
+      setPendingFormError("通信エラーにより保存できませんでした。");
+    } finally {
+      setIsSavingRecord(false);
+    }
+  };
+
   const handleSubmit = async () => {
     if (!message.trim()) return;
 
     setIsLoading(true);
-    setReply("");
+    setChatError(null);
     setSaveHint(null);
+    setPendingFormError(null);
+    setPendingRecord(null);
 
     try {
+      const nextMessages: ChatTurn[] = [
+        ...chatTurns,
+        { role: "user", content: message.trim() },
+      ];
+
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ messages: nextMessages }),
       });
 
       const data = await response.json();
 
       if (response.ok) {
-        const json = data.json as NutritionJson;
-        setReply(JSON.stringify(json, null, 2));
-
-        const memoRes = await fetch("/api/memo", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ rawInput: message, result: json }),
-        });
-        const memoData = (await memoRes.json()) as { error?: string };
-        if (!memoRes.ok) {
-          setSaveHint(null);
-          setDbError(
-            typeof memoData.error === "string"
-              ? memoData.error
-              : "DBへの保存に失敗しました。"
-          );
-        } else {
-          setDbError(null);
-          setSaveHint("記録テーブルに保存しました。");
+        const assistantMessage =
+          typeof data.assistantMessage === "string" ? data.assistantMessage : "";
+        const nutritionRaw = data.nutrition;
+        if (!nutritionRaw || typeof nutritionRaw !== "object") {
+          setChatError("応答形式が不正です。");
+          return;
         }
+        const n = coerceNutrition(nutritionRaw);
+        const am =
+          assistantMessage.trim() ||
+          "推定が完了しました。下記の内容を確認し、問題なければ記録してください。";
 
-        await refreshLogs();
+        setChatTurns([
+          ...nextMessages,
+          {
+            role: "assistant",
+            content: formatAssistantTurnForHistory(am, n),
+          },
+        ]);
+        setMessage("");
+        setPendingFoodsExpanded(false);
+
+        const combinedRaw = nextMessages
+          .filter((t): t is ChatTurn & { role: "user" } => t.role === "user")
+          .map((t) => t.content)
+          .join("\n\n");
+
+        setPendingRecord({
+          assistantMessage: am,
+          baseNutrition: n,
+          draft: {
+            rawInput: combinedRaw,
+            foodsLine: formatFoodsSummary(n),
+            kcal: String(n.total.kcal),
+            p: String(n.total.p),
+            f: String(n.total.f),
+            c: String(n.total.c),
+          },
+        });
       } else {
         const detail =
           typeof data.details === "string" && data.details
-            ? `\n\n（詳細）\n${data.details}`
+            ? `\n（詳細）${data.details}`
             : "";
         const raw =
-          typeof data.raw === "string" && data.raw ? `\n\n（raw）\n${data.raw}` : "";
-        setReply(`エラー: ${data.error}${detail}${raw}`);
+          typeof data.raw === "string" && data.raw ? `\n（raw）${data.raw}` : "";
+        setChatError(
+          `${typeof data.error === "string" ? data.error : "エラーが発生しました"}${detail}${raw}`
+        );
       }
     } catch {
-      setReply("通信エラーが発生しました");
+      setChatError("通信エラーが発生しました");
     } finally {
       setIsLoading(false);
     }
@@ -351,6 +498,7 @@ export default function Home() {
           </h1>
           <p className="mt-2 text-sm text-neutral-600">
             Gemini 2.5 Flash に食事内容を投げて、カロリー/PFCの推定を返します。
+            推定後も下の入力欄に続きを書いて送信すると、直前までの内容を踏まえて再推定します。
           </p>
         </div>
 
@@ -365,9 +513,53 @@ export default function Home() {
             <CardTitle>AI 食事記録</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
+            {chatTurns.length > 0 ? (
+              <div className="rounded-md border border-neutral-200 bg-white p-3">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-neutral-600">
+                    この食事のやりとり（文脈として AI に渡しています）
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 text-xs"
+                    onClick={clearConversation}
+                    disabled={isLoading}
+                  >
+                    会話をクリア
+                  </Button>
+                </div>
+                <ul className="max-h-52 space-y-2 overflow-y-auto text-sm">
+                  {chatTurns.map((t, i) => (
+                    <li
+                      key={`${t.role}-${i}`}
+                      className={cn(
+                        "rounded-md px-2 py-2",
+                        t.role === "user" ? "bg-neutral-100" : "bg-sky-50/80"
+                      )}
+                    >
+                      <span className="text-xs font-semibold text-neutral-500">
+                        {t.role === "user" ? "あなた" : "AI"}
+                      </span>
+                      <p className="mt-0.5 whitespace-pre-wrap text-neutral-800">
+                        {t.role === "assistant"
+                          ? displayAssistantHistoryContent(t.content)
+                          : t.content}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
             <Textarea
               rows={4}
-              placeholder="例: さば味噌定食（ご飯大盛り）を食べました。カロリーとPFCを推定して。"
+              placeholder={
+                chatTurns.length
+                  ? "続きの訂正や補足（例: やっぱりからあげは2個でした）を書いて送信してください。"
+                  : "例: 朝カロリーメイト、昼はおにぎりと… 夜は麻婆豆腐と米100g など。カロリーとPFCを推定して。"
+              }
               value={message}
               onChange={(e) => setMessage(e.target.value)}
             />
@@ -380,17 +572,225 @@ export default function Home() {
               </span>
             </div>
 
-            {reply && (
-              <div className="rounded-md border border-neutral-200 bg-neutral-50 p-4">
-                <h3 className="text-sm font-semibold text-neutral-900">AIの回答</h3>
-                <pre className="mt-2 whitespace-pre-wrap text-sm text-neutral-700">
-                  {reply}
-                </pre>
-                {saveHint ? (
-                  <p className="mt-2 text-sm font-medium text-emerald-700">{saveHint}</p>
-                ) : null}
+            {chatError ? (
+              <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900 whitespace-pre-wrap">
+                {chatError}
               </div>
-            )}
+            ) : null}
+
+            {pendingRecord ? (
+              <div className="space-y-4 rounded-md border border-emerald-200 bg-emerald-50/40 p-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-neutral-900">AIの回答</h3>
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">
+                    {pendingRecord.assistantMessage}
+                  </p>
+                </div>
+                <p className="text-sm font-medium text-neutral-900">
+                  このデータを記録してよろしいですか？内容を確認・編集したうえで「記録する」を押してください。
+                </p>
+                {pendingFormError ? (
+                  <p className="text-sm text-red-700">{pendingFormError}</p>
+                ) : null}
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="sm:col-span-2">
+                    <label htmlFor="pending-raw" className="mb-1 block text-xs font-medium text-neutral-600">
+                      内容（食事の説明）
+                    </label>
+                    <Textarea
+                      id="pending-raw"
+                      rows={3}
+                      className="text-sm"
+                      value={pendingRecord.draft.rawInput}
+                      onChange={(e) => {
+                        setPendingFormError(null);
+                        setPendingRecord((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                draft: { ...prev.draft, rawInput: e.target.value },
+                              }
+                            : null
+                        );
+                      }}
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label htmlFor="pending-foods" className="mb-1 block text-xs font-medium text-neutral-600">
+                      内訳（食品）
+                    </label>
+                    <Textarea
+                      id="pending-foods"
+                      rows={2}
+                      className="text-sm"
+                      value={pendingRecord.draft.foodsLine}
+                      onChange={(e) => {
+                        setPendingFormError(null);
+                        setPendingRecord((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                draft: { ...prev.draft, foodsLine: e.target.value },
+                              }
+                            : null
+                        );
+                      }}
+                    />
+                    {pendingRecord.baseNutrition.foods.length > 0 ? (
+                      <div className="mt-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="text-xs"
+                          aria-expanded={pendingFoodsExpanded}
+                          onClick={() => setPendingFoodsExpanded((v) => !v)}
+                        >
+                          {pendingFoodsExpanded ? "▼" : "▶"} 食品ごとの kcal / PFC を表示
+                        </Button>
+                        {pendingFoodsExpanded ? (
+                          <ul className="mt-2 space-y-1.5 rounded-md border border-neutral-200 bg-white p-3 text-left">
+                            {pendingRecord.baseNutrition.foods.map((food, idx) => (
+                              <li
+                                key={`pending-f-${idx}`}
+                                className="font-mono text-[13px] text-neutral-800"
+                              >
+                                {formatFoodItemLine(food)}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div>
+                    <label htmlFor="pending-kcal" className="mb-1 block text-xs font-medium text-neutral-600">
+                      カロリー（kcal）
+                    </label>
+                    <input
+                      id="pending-kcal"
+                      type="number"
+                      inputMode="decimal"
+                      className={inputClass}
+                      value={pendingRecord.draft.kcal}
+                      onChange={(e) => {
+                        setPendingFormError(null);
+                        setPendingRecord((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                draft: { ...prev.draft, kcal: e.target.value },
+                              }
+                            : null
+                        );
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="pending-p" className="mb-1 block text-xs font-medium text-neutral-600">
+                      タンパク質 P（g）
+                    </label>
+                    <input
+                      id="pending-p"
+                      type="number"
+                      inputMode="decimal"
+                      className={inputClass}
+                      value={pendingRecord.draft.p}
+                      onChange={(e) => {
+                        setPendingFormError(null);
+                        setPendingRecord((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                draft: { ...prev.draft, p: e.target.value },
+                              }
+                            : null
+                        );
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="pending-f" className="mb-1 block text-xs font-medium text-neutral-600">
+                      脂質 F（g）
+                    </label>
+                    <input
+                      id="pending-f"
+                      type="number"
+                      inputMode="decimal"
+                      className={inputClass}
+                      value={pendingRecord.draft.f}
+                      onChange={(e) => {
+                        setPendingFormError(null);
+                        setPendingRecord((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                draft: { ...prev.draft, f: e.target.value },
+                              }
+                            : null
+                        );
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="pending-c" className="mb-1 block text-xs font-medium text-neutral-600">
+                      炭水化物 C（g）
+                    </label>
+                    <input
+                      id="pending-c"
+                      type="number"
+                      inputMode="decimal"
+                      className={inputClass}
+                      value={pendingRecord.draft.c}
+                      onChange={(e) => {
+                        setPendingFormError(null);
+                        setPendingRecord((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                draft: { ...prev.draft, c: e.target.value },
+                              }
+                            : null
+                        );
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="flex flex-col gap-2">
+                  {sessionStatus !== "authenticated" ? (
+                    <p className="text-sm text-amber-900">
+                      記録するには{" "}
+                      <Link href="/login" className="font-medium text-neutral-900 underline">
+                        ログイン
+                      </Link>{" "}
+                      が必要です。
+                    </p>
+                  ) : null}
+                  <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    onClick={() => void savePendingToMemo()}
+                    disabled={isSavingRecord || sessionStatus !== "authenticated"}
+                  >
+                    {isSavingRecord ? "保存中…" : "記録する"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setPendingRecord(null);
+                      setPendingFormError(null);
+                    }}
+                    disabled={isSavingRecord}
+                  >
+                    記録しない
+                  </Button>
+                  </div>
+                </div>
+              </div>
+            ) : saveHint ? (
+              <p className="text-sm font-medium text-emerald-700">{saveHint}</p>
+            ) : null}
           </CardContent>
         </Card>
 
@@ -472,7 +872,7 @@ export default function Home() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="min-w-[56rem] w-full border-collapse overflow-hidden rounded-lg border border-neutral-200 bg-white">
+              <table className="min-w-[58rem] w-full border-collapse overflow-hidden rounded-lg border border-neutral-200 bg-white">
                 <thead className="bg-neutral-900 text-white">
                   <tr>
                     <th className="w-10 px-2 py-3 text-center text-sm font-medium">
@@ -496,6 +896,9 @@ export default function Home() {
                     <th className="px-4 py-3 text-left text-sm font-medium min-w-[8rem]">
                       内訳（食品）
                     </th>
+                    <th className="w-12 px-1 py-3 text-center text-sm font-medium" title="食品ごとの kcal / PFC">
+                      品目
+                    </th>
                     <th className="px-4 py-3 text-right text-sm font-medium whitespace-nowrap">
                       カロリー
                     </th>
@@ -518,10 +921,12 @@ export default function Home() {
                     const n = coerceNutrition(log.result);
                     const isEditing = editing.has(log.id);
                     const draft = drafts[log.id];
+                    const hasFoods = n.foods.length > 0;
+                    const detailOpen = expandedFoodRows.has(log.id);
 
                     return (
+                      <Fragment key={log.id}>
                       <tr
-                        key={log.id}
                         className={cn(
                           "even:bg-neutral-50 hover:bg-neutral-100",
                           isEditing && "bg-amber-50/60 hover:bg-amber-50/80"
@@ -574,6 +979,21 @@ export default function Home() {
                               {formatFoodsSummary(n)}
                             </span>
                           )}
+                        </td>
+                        <td className="border-b border-neutral-200 px-1 py-2 text-center align-top">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 shrink-0 p-0 text-neutral-600"
+                            disabled={!hasFoods}
+                            aria-expanded={detailOpen}
+                            aria-label={detailOpen ? "品目内訳を閉じる" : "品目内訳を開く"}
+                            title={hasFoods ? "食品ごとの kcal / PFC" : "品目データなし"}
+                            onClick={() => toggleFoodDetailRow(log.id)}
+                          >
+                            {detailOpen ? "▼" : "▶"}
+                          </Button>
                         </td>
                         <td className="border-b border-neutral-200 px-4 py-2 text-right align-top">
                           {isEditing && draft ? (
@@ -663,17 +1083,37 @@ export default function Home() {
                           )}
                         </td>
                       </tr>
+                      {detailOpen && hasFoods ? (
+                        <tr className="bg-neutral-100/90">
+                          <td
+                            colSpan={10}
+                            className="border-b border-neutral-200 px-4 py-3 text-left"
+                          >
+                            <p className="mb-2 text-xs font-semibold text-neutral-600">
+                              食品ごとの内訳（AI 推定）
+                            </p>
+                            <ul className="space-y-1.5 text-sm leading-relaxed text-neutral-800">
+                              {n.foods.map((food, idx) => (
+                                <li key={`${log.id}-f-${idx}`} className="font-mono text-[13px]">
+                                  {formatFoodItemLine(food)}
+                                </li>
+                              ))}
+                            </ul>
+                          </td>
+                        </tr>
+                      ) : null}
+                      </Fragment>
                     );
                   })}
                   {!logs.length && (
                     <tr>
                       <td
-                        colSpan={9}
+                        colSpan={10}
                         className="border-b border-neutral-200 px-6 py-6 text-left text-sm text-neutral-500"
                       >
                         {dbError
                           ? "上記の手順でDBを起動・マイグレーションすると、ここに記録が表示されます。"
-                          : "まだ記録がありません。上のフォームから送信すると自動で保存されます。"}
+                          : "まだ記録がありません。食事を送信し、確認画面から記録してください。"}
                       </td>
                     </tr>
                   )}

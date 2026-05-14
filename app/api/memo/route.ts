@@ -1,7 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth/next";
 import { Prisma } from "@prisma/client";
+import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { coerceNutrition, buildPatchedMealResult } from "@/lib/mealNutrition";
+
+async function requireUserId(): Promise<{ ok: true; userId: string } | { ok: false; res: NextResponse }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) {
+    return {
+      ok: false,
+      res: NextResponse.json({ error: "ログインが必要です", logs: [] }, { status: 401 }),
+    };
+  }
+  return { ok: true, userId: session.user.id };
+}
 
 function dbUnavailableMessage(error: unknown): string | null {
   const msg = error instanceof Error ? error.message : String(error);
@@ -22,8 +35,12 @@ function dbUnavailableMessage(error: unknown): string | null {
 }
 
 export async function GET() {
+  const auth = await requireUserId();
+  if (!auth.ok) return auth.res;
+
   try {
     const logs = await prisma.mealLog.findMany({
+      where: { userId: auth.userId },
       orderBy: { createdAt: "desc" },
       take: 30,
     });
@@ -43,6 +60,9 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = await requireUserId();
+  if (!auth.ok) return auth.res;
+
   try {
     const body = await req.json();
     const rawInput = body?.rawInput;
@@ -65,6 +85,7 @@ export async function POST(req: NextRequest) {
         totalP: normalized.total.p,
         totalF: normalized.total.f,
         totalC: normalized.total.c,
+        userId: auth.userId,
       },
     });
 
@@ -82,6 +103,9 @@ export async function POST(req: NextRequest) {
 const DELETE_MAX_IDS = 100;
 
 export async function DELETE(req: NextRequest) {
+  const auth = await requireUserId();
+  if (!auth.ok) return auth.res;
+
   try {
     const body = (await req.json().catch(() => null)) as { ids?: unknown } | null;
     const idsRaw = body?.ids;
@@ -112,7 +136,7 @@ export async function DELETE(req: NextRequest) {
     }
 
     const result = await prisma.mealLog.deleteMany({
-      where: { id: { in: unique } },
+      where: { id: { in: unique }, userId: auth.userId },
     });
 
     return NextResponse.json({ deleted: result.count });
@@ -150,6 +174,9 @@ function parseTotalForPatch(
 }
 
 export async function PATCH(req: NextRequest) {
+  const auth = await requireUserId();
+  if (!auth.ok) return auth.res;
+
   try {
     const body = (await req.json().catch(() => null)) as { items?: unknown } | null;
     const itemsRaw = body?.items;
@@ -209,13 +236,13 @@ export async function PATCH(req: NextRequest) {
     }
 
     const existing = await prisma.mealLog.findMany({
-      where: { id: { in: uniqueIds } },
+      where: { id: { in: uniqueIds }, userId: auth.userId },
     });
     if (existing.length !== uniqueIds.length) {
       const found = new Set(existing.map((e) => e.id));
       const missing = uniqueIds.filter((id) => !found.has(id));
       return NextResponse.json(
-        { error: `存在しない id があります: ${missing.join(", ")}` },
+        { error: `更新できない id があります（自分の記録のみ）: ${missing.join(", ")}` },
         { status: 404 }
       );
     }

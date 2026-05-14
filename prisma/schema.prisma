@@ -14,6 +14,26 @@ model Memo {
   userId    String
 }
 
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  age          Int
+  gender       String
+  heightCm     Float
+  weightKg     Float
+  /// AI が後から設定する目標 PFC（g/日）。現状は null
+  targetProteinG Float?
+  targetFatG     Float?
+  targetCarbsG   Float?
+  targetKcal     Float?
+  pfcSetAt       DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  mealLogs MealLog[]
+}
+
 model MealLog {
   id        Int      @id @default(autoincrement())
   rawInput  String
@@ -23,6 +43,9 @@ model MealLog {
   totalF    Float?
   totalC    Float?
   createdAt DateTime @default(now())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([createdAt])
+  @@index([userId])
 }

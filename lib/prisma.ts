@@ -5,11 +5,30 @@ declare global {
   var prisma: PrismaClient | undefined;
 }
 
-export const prisma =
-  globalThis.prisma ??
+/** After `schema.prisma` changes, dev HMR can keep a stale PrismaClient without new delegates (e.g. `user`). */
+function hasUserDelegate(client: unknown): boolean {
+  if (typeof client !== "object" || client === null) return false;
+  const u = (client as { user?: { create?: unknown } }).user;
+  return typeof u?.create === "function";
+}
+
+const createClient = () =>
   new PrismaClient({
     log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
   });
 
-if (process.env.NODE_ENV !== "production") globalThis.prisma = prisma;
+export const prisma: PrismaClient = (() => {
+  const cached = globalThis.prisma;
+  if (cached && hasUserDelegate(cached)) {
+    return cached;
+  }
+  if (cached && process.env.NODE_ENV !== "production") {
+    void cached.$disconnect();
+  }
+  const client = createClient();
+  if (process.env.NODE_ENV !== "production") {
+    globalThis.prisma = client;
+  }
+  return client;
+})();
 
