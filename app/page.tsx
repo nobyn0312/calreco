@@ -497,7 +497,7 @@ export default function Home() {
             Calreco
           </h1>
           <p className="mt-2 text-sm text-neutral-600">
-            Gemini 2.5 Flash に食事内容を投げて、カロリー/PFCの推定を返します。
+            カロレコAIが、毎日のカロリー/PFCを推定します。
             推定後も下の入力欄に続きを書いて送信すると、直前までの内容を踏まえて再推定します。
           </p>
         </div>
