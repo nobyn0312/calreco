@@ -42,8 +42,8 @@ type RowDraft = {
 const inputClass =
   "w-full min-w-[3.5rem] rounded-md border border-neutral-200 bg-white px-2 py-1.5 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400";
 
-function toDateTimeLocalValue(iso:string):string {
-  const d = new Date(iso):
+function toDatetimeLocalValue(iso:string):string {
+  const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   const pad = (n:number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
